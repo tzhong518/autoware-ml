@@ -22,6 +22,8 @@ from typing import Any
 import numpy as np
 
 from autoware_ml.transforms.base import BaseTransform
+from autoware_ml.transforms.camera.annotations2d import _boxes3d_corners, _project_points
+from autoware_ml.transforms.camera.utils import normalize_mask_polygon, points_inside_polygon
 
 _BOX_KEYS = ("gt_boxes", "gt_names", "gt_labels", "gt_num_points")
 
@@ -297,5 +299,159 @@ class ObjectRangeMinPointsFilter(BaseTransform):
         in_range = (radii >= self.min_radius) & (radii < self.max_radius)
         counts = _count_points_in_rotated_boxes(_resolve_point_coords(input_dict), boxes)
         mask = ~in_range | (counts >= self.min_num_points)
+        _filter_present_box_keys(input_dict, mask)
+        return input_dict
+
+
+class EgoAreaMaskFilter(BaseTransform):
+    """Drop 3D boxes whose projection falls entirely inside an ego-body mask.
+
+    Cameras mounted on the ego vehicle can have part of their field of view
+    occluded by the vehicle's own body or mirrors. For each camera, a fixed
+    normalized polygon marks that occluded region in image space. A box is
+    removed only if, in every camera where it projects into the image, its
+    clipped 2D bounding box lies entirely inside that camera's polygon - i.e.
+    the box is not genuinely visible anywhere else either.
+
+    Required keys:
+        gt_boxes: 3D bounding boxes ``(N, >=7)`` as gravity-center
+            ``[x, y, z, dx, dy, dz, yaw, ...]``, in lidar frame.
+        gt_labels: Per-box label indices, only used to keep filtered arrays aligned.
+        lidar2cam: Per-camera lidar-to-camera transforms, shape ``(num_cams, 4, 4)``.
+        camera_intrinsics: Per-camera intrinsics, shape ``(num_cams, 3, 3)`` or ``(num_cams, 4, 4)``.
+        img: Per-camera images, shape ``(num_cams, C, H, W)`` - only used for image size.
+        camera_names: Per-sample camera names in the same order as the stacked
+            per-camera arrays. Read from the sample rather than from config
+            because ``LoadMultiViewImagesFromFiles(shuffle_order=True)``
+            permutes the camera order per sample; indexing a static config
+            list would apply each polygon to the wrong camera.
+
+    Optional keys:
+        gt_names: Per-box class name array. Filtered when present.
+        gt_num_points: Per-box lidar point counts. Filtered when present.
+
+    Generated keys:
+        gt_boxes: Filtered boxes.
+        gt_names: Filtered class names (when present).
+        gt_labels: Filtered labels.
+        gt_num_points: Filtered lidar point counts (when present).
+    """
+
+    _required_keys = [
+        "gt_boxes",
+        "gt_labels",
+        "lidar2cam",
+        "camera_intrinsics",
+        "img",
+        "camera_names",
+    ]
+
+    def __init__(self, *, camera_masks: dict[str, Sequence[float]]) -> None:
+        """Initialize the EgoAreaMaskFilter transform.
+
+        Args:
+            camera_masks: Mapping from camera name to a flat normalized
+                ``[x0, y0, x1, y1, ...]`` polygon marking that camera's
+                ego-occluded region. Cameras absent from this mapping are not masked.
+        """
+        self.camera_polygons = {
+            str(camera): normalize_mask_polygon(polygon) for camera, polygon in camera_masks.items()
+        }
+
+    def transform(self, input_dict: dict[str, Any]) -> dict[str, Any]:
+        """Remove boxes that are ego-masked in every camera they project into.
+
+        Args:
+            input_dict: Sample dictionary updated in place.
+
+        Returns:
+            Updated sample dictionary with fully ego-masked boxes removed.
+        """
+        gt_boxes = np.asarray(input_dict["gt_boxes"], dtype=np.float32)
+        if gt_boxes.shape[0] == 0:
+            return input_dict
+
+        images = input_dict["img"]
+        image_height, image_width = int(images.shape[-2]), int(images.shape[-1])
+        corners = _boxes3d_corners(gt_boxes)
+
+        camera_names = list(input_dict["camera_names"])
+        num_cams = len(input_dict["lidar2cam"])
+        if len(camera_names) != num_cams:
+            raise ValueError(
+                f"camera_names has {len(camera_names)} entries but {num_cams} cameras are stacked; "
+                "per-camera polygons cannot be matched reliably."
+            )
+        # visible_and_unmasked[b, c]: box b projects into camera c and is not
+        # fully covered by that camera's ego polygon there.
+        visible_and_unmasked = np.zeros((gt_boxes.shape[0], num_cams), dtype=bool)
+        projects_anywhere = np.zeros(gt_boxes.shape[0], dtype=bool)
+
+        # Homogeneous corners once for every box: (N * 8, 4). Projecting all
+        # boxes of a camera in one matmul is what keeps this off a per-box
+        # Python loop; the only remaining loop is over the handful of cameras.
+        num_boxes = gt_boxes.shape[0]
+        corners_hom = np.concatenate(
+            [corners.reshape(-1, 3), np.ones((num_boxes * 8, 1), dtype=corners.dtype)], axis=1
+        ).astype(np.float64)
+
+        for camera_index in range(num_cams):
+            polygon = self.camera_polygons.get(camera_names[camera_index])
+            lidar2cam = np.asarray(input_dict["lidar2cam"][camera_index], dtype=np.float64)
+            cam2img = np.asarray(input_dict["camera_intrinsics"][camera_index], dtype=np.float64)
+
+            points_cam = corners_hom @ lidar2cam.T
+            in_front = (points_cam[:, 2] > 0).reshape(num_boxes, 8)
+            projected = points_cam[:, :3] @ cam2img[:3, :3].T
+            pixels = projected[:, :2] / np.maximum(projected[:, 2:3], 1e-6)
+            pixels = pixels.reshape(num_boxes, 8, 2)
+
+            # Reduce over corners while ignoring the ones behind the camera, by
+            # pushing masked-out corners to +/-inf so they never win min/max.
+            has_corner = in_front.any(axis=1)
+            xs = np.where(in_front, pixels[..., 0], np.inf)
+            ys = np.where(in_front, pixels[..., 1], np.inf)
+            x_min = np.clip(xs.min(axis=1), 0, image_width)
+            y_min = np.clip(ys.min(axis=1), 0, image_height)
+            xs = np.where(in_front, pixels[..., 0], -np.inf)
+            ys = np.where(in_front, pixels[..., 1], -np.inf)
+            x_max = np.clip(xs.max(axis=1), 0, image_width)
+            y_max = np.clip(ys.max(axis=1), 0, image_height)
+
+            projects = has_corner & (x_min != x_max) & (y_min != y_max)
+            if not projects.any():
+                continue
+            projects_anywhere |= projects
+
+            if polygon is None:
+                visible_and_unmasked[:, camera_index] |= projects
+                continue
+
+            # A rectangle lies inside a convex-enough polygon iff all 4 of its
+            # corners do, which is the same test AWML applies per box.
+            pixel_polygon = polygon * np.array(
+                [image_width - 1, image_height - 1], dtype=np.float32
+            )
+            box_corners = np.stack(
+                [
+                    np.stack([x_min, y_min], axis=1),
+                    np.stack([x_max, y_min], axis=1),
+                    np.stack([x_max, y_max], axis=1),
+                    np.stack([x_min, y_max], axis=1),
+                ],
+                axis=1,
+            )
+            inside = points_inside_polygon(
+                box_corners.reshape(-1, 2).astype(np.float32), pixel_polygon
+            ).reshape(num_boxes, 4)
+            fully_masked = inside.all(axis=1)
+            visible_and_unmasked[:, camera_index] |= projects & ~fully_masked
+
+        # Keep boxes that never project into any camera untouched (some other
+        # filter's job) and boxes that are unmasked in at least one camera
+        # they do project into. Drop only boxes that project somewhere and
+        # are ego-masked in every camera they reach.
+        ego_masked_everywhere = projects_anywhere & ~visible_and_unmasked.any(axis=1)
+        mask = ~ego_masked_everywhere
         _filter_present_box_keys(input_dict, mask)
         return input_dict

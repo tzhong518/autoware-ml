@@ -1,0 +1,101 @@
+# @package _global_
+# StreamPETR on T4/j6gen2 with ego-body occlusion masking added on top of the
+# default j6gen2 recipe (vov_480x640_t4dataset_j6gen2).
+#
+# Ports the ego-mask half of AWML's `Filter3DBoxesinBlindSpot`
+#   projects/StreamPETR/stream_petr/datasets/pipelines/loading.py
+# as used by
+#   projects/StreamPETR/configs/t4dataset/
+#     t4_base_vov_flash_480x640_bev_2_8_traffic_barrier_j6gen2_partialignore_visibility_weightedxy_egomask_blindspot.py
+#
+# Only the ego-mask behaviour is ported. AWML's companion gates in the same
+# transform - the projected-area visibility ratio (`visibility=0.05`,
+# `min_visible_area=800`) and the `min_lidar_points=3` cut - are deliberately
+# NOT included here, so this config differs from the AWML run in more than the
+# ego mask alone. Everything else (backbone, LRs, batch, epochs, augmentation,
+# partial-ignore, eval ranges) is inherited unchanged from the base recipe.
+#
+# Two independent mechanisms, both driven by the same per-camera polygons:
+#   * EgoAreaMaskPaint  - paints the ego-occluded region black in the image.
+#   * EgoAreaMaskFilter - drops GT boxes that are ego-masked in EVERY camera
+#     they project into (a box still visible in some other camera is kept).
+# Train-time only: val/test/predict pipelines are inherited untouched, so
+# evaluation still scores against unfiltered GT and is comparable to the base
+# recipe's numbers.
+defaults:
+  - /tasks/detection3d/streampetr/vov_480x640_t4dataset_j6gen2
+  - _self_
+
+batch_size: 8 
+
+# Normalized image-space polygons; x is horizontal, y is vertical, both in
+# [0, 1] and rescaled to the live image size by the transforms. Copied
+# verbatim from AWML's `ego_vehicle_masks`. CAM_FRONT has no entry: it does
+# not see the ego body, and cameras absent from this mapping are left alone.
+ego_vehicle_masks:
+  j6gen2:
+    CAM_FRONT_LEFT: [0.64, 1.0, 0.73, 0.65, 0.8, 0.65, 0.79, 0.74, 0.97, 0.83, 1.0, 0.73, 1.0, 1.0]
+    CAM_FRONT_RIGHT: [0.19, 1.0, 0.21, 0.89, 0.38, 0.89, 0.39, 1.0]
+    CAM_BACK_LEFT: [0.0, 0.0, 0.11, 0.0, 0.2, 1.0, 0.0, 1.0] #[0.88, 0.0, 1.0, 0.0, 1.0, 1.0, 0.8, 1.0]
+    CAM_BACK_RIGHT: [0.88, 0.0, 1.0, 0.0, 1.0, 1.0, 0.8, 1.0] #[0.0, 0.0, 0.11, 0.0, 0.2, 1.0, 0.0, 1.0]
+
+datamodule:
+  # The pipeline is an ordered list with no key-based reordering, so it must be
+  # restated in full to insert the two transforms at the right positions:
+  # Hydra would otherwise merge the override list element-wise by index.
+  train_transforms:
+    _target_: autoware_ml.transforms.base.TransformsCompose
+    pipeline:
+      - _target_: autoware_ml.transforms.boxes3d.merge.MergeObjects3D
+        merge_objects: ${dataset.detection3d.merge_objects}
+        name_mapping: ${dataset.detection3d.name_mapping}
+      - _target_: autoware_ml.transforms.boxes3d.loading.LoadAnnotations3D
+        name_mapping: ${dataset.detection3d.name_mapping}
+        filter_attributes: ${dataset.detection3d.filter_attributes}
+        use_valid_flag: ${dataset.detection3d.use_valid_flag}
+      - _target_: autoware_ml.transforms.camera.loading.LoadMultiViewImagesFromFiles
+        # Keep pixels in [0,255]: img_norm_cfg mean/std are 0-255-scale ImageNet stats.
+        normalize_to_unit: false
+        # The reference recipe shuffles the camera order every training frame
+        # (StreamPETRDataset shuffle_cameras=True); train-time only. Both ego-mask
+        # transforms therefore key their polygons off the per-sample
+        # `camera_names` this emits, never off a positional config list.
+        shuffle_order: true
+      # Must sit between image loading and ResizeCropFlipRotImage: the polygons
+      # are authored against the raw, unflipped camera view, so painting first
+      # lets the masked region ride through the resize/crop/flip with the pixels.
+      # Painting after `rand_flip` would put the mask on the wrong side.
+      - _target_: autoware_ml.transforms.camera.masking.EgoAreaMaskPaint
+        camera_masks: ${ego_vehicle_masks.j6gen2}
+        mask_color: [0, 0, 0]
+      - _target_: autoware_ml.transforms.camera.resize.ResizeCropFlipRotImage
+        data_aug_conf:
+          resize_lim: 0.02
+          final_dim: [480, 640]
+          bot_pct_lim: [0.0, 0.0]
+          rot_lim: [0.0, 0.0]
+          rand_flip: true
+        training: true
+      - _target_: autoware_ml.transforms.camera.geometry.GlobalRotScaleTrans
+        rot_range: [-0.3925, 0.3925]
+        scale_ratio_range: [0.95, 1.05]
+      - _target_: autoware_ml.transforms.camera.resize.PadMultiViewImage
+        size_divisor: 32
+      - _target_: autoware_ml.transforms.camera.normalize.NormalizeMultiviewImage
+        mean: ${img_norm_cfg.mean}
+        std: ${img_norm_cfg.std}
+        to_rgb: ${img_norm_cfg.to_rgb}
+      # 2D annotations are projected from the augmented 3D boxes BEFORE the
+      # range filter (matching the reference): the auxiliary 2D head
+      # supervises every visible object even outside the 3D detection range.
+      - _target_: autoware_ml.transforms.camera.annotations2d.LoadAnnotations2DFromBoxes3D
+      # Runs after LoadAnnotations2DFromBoxes3D so the auxiliary 2D head still
+      # sees every projected object, and before ObjectRangeFilter purely to keep
+      # the GT-narrowing steps together. Placement relative to
+      # ResizeCropFlipRotImage / GlobalRotScaleTrans does not affect the result:
+      # it reprojects from whatever `gt_boxes` and `lidar2cam` are live, and
+      # GlobalRotScaleTrans keeps those two mutually consistent.
+      - _target_: autoware_ml.transforms.boxes3d.filters.EgoAreaMaskFilter
+        camera_masks: ${ego_vehicle_masks.j6gen2}
+      - _target_: autoware_ml.transforms.boxes3d.filters.ObjectRangeFilter
+        point_cloud_range: ${point_cloud_range}
