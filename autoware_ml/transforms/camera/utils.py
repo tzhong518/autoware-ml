@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -52,3 +53,60 @@ def restore_image_container(
         return np.stack(restored, axis=0)
     del template
     return restored[0]
+
+
+def normalize_mask_polygon(polygon: Sequence[float]) -> npt.NDArray:
+    """Validate and reshape a flat ``[x0, y0, x1, y1, ...]`` polygon.
+
+    Args:
+        polygon: Flat sequence of normalized ``[0, 1]`` image-space x/y pairs.
+
+    Returns:
+        Polygon vertices with shape ``(K, 2)``.
+    """
+    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+    if points.shape[0] < 3:
+        raise ValueError("Mask polygon requires at least 3 normalized x/y points.")
+    if np.any((points < 0.0) | (points > 1.0)):
+        raise ValueError("Mask polygon values must be normalized to [0, 1].")
+    return points
+
+
+def mask_polygon_to_pixels(polygon: npt.NDArray, width: int, height: int) -> npt.NDArray:
+    """Scale a normalized polygon to integer pixel coordinates.
+
+    Args:
+        polygon: Normalized polygon vertices with shape ``(K, 2)``.
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        Integer pixel-space polygon vertices with shape ``(K, 2)``.
+    """
+    pixels = polygon.copy()
+    pixels[:, 0] *= width - 1
+    pixels[:, 1] *= height - 1
+    return np.rint(pixels).astype(np.int32)
+
+
+def points_inside_polygon(points: npt.NDArray, polygon: npt.NDArray) -> npt.NDArray:
+    """Test each point for containment in a polygon via ray casting.
+
+    Args:
+        points: Query points with shape ``(N, 2)`` in the same space as ``polygon``.
+        polygon: Polygon vertices with shape ``(K, 2)``.
+
+    Returns:
+        Boolean array of shape ``(N,)``, ``True`` where the point is inside.
+    """
+    x, y = points[:, 0], points[:, 1]
+    poly_x, poly_y = polygon[:, 0], polygon[:, 1]
+    inside = np.zeros(len(points), dtype=bool)
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        crosses = ((poly_y[i] > y) != (poly_y[j] > y)) & (
+            x <= (poly_x[j] - poly_x[i]) * (y - poly_y[i]) / (poly_y[j] - poly_y[i] + 1e-12) + poly_x[i]
+        )
+        inside ^= crosses
+        j = i
+    return inside
