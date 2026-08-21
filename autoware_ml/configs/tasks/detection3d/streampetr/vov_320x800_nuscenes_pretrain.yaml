@@ -1,12 +1,24 @@
 # @package _global_
+# Stage 1 of the three-stage StreamPETR flow
+# (nuScenes pretrain -> T4 base -> j6gen2 fine-tune).
+#
+# 2 GPUs x batch 8 (total 16), 30 epochs, grad-clip 35, random flip and global
+# rot/scale augmentation. Uses the CPFPN neck and the auxiliary FocalHead2D so
+# the produced checkpoint is architecturally identical to the T4 stages and
+# loads into stage 2 as-is; all three stages share the same 7 classes, so no
+# classification layer is dropped along the way.
+#
+# Needs the nuScenes dataset mounted and the DD3D/FCOS3D-pretrained VoVNet-99
+# backbone as --weights; without that backbone init the recipe underperforms.
+# See docs/models/streampetr.md for the download and preparation.
 defaults:
   - /tasks/detection3d/streampetr/base
   - /datasets/nuscenes/detection3d
   - /datasets/nuscenes/camera
   - _self_
 
-batch_size: 8
-num_workers: 16
+batch_size: 8          # per-GPU; 2 GPUs -> total batch 16
+num_workers: 8
 
 dataset: ${nuscenes}
 
@@ -34,12 +46,20 @@ datamodule:
   test_dataloader_cfg:
     batch_size: 1
     num_workers: ${num_workers}
+  # Produced by LoadAnnotations2DFromBoxes3D, which only the train pipeline runs.
+  train_collation_map:
+    gt_bboxes_2d: list
+    gt_labels_2d: list
+    centers_2d: list
   train_transforms:
     _target_: autoware_ml.transforms.base.TransformsCompose
     pipeline:
       - _target_: autoware_ml.transforms.boxes3d.loading.LoadAnnotations3D
         name_mapping: ${dataset.detection3d.name_mapping}
       - _target_: autoware_ml.transforms.camera.loading.LoadMultiViewImagesFromFiles
+        normalize_to_unit: false
+      # The nuScenes pipeline range-filters before augmentation, unlike the T4
+      # pipeline, which filters after projecting the 2D annotations.
       - _target_: autoware_ml.transforms.boxes3d.filters.ObjectRangeFilter
         point_cloud_range: ${point_cloud_range}
       - _target_: autoware_ml.transforms.camera.resize.ResizeCropFlipRotImage
@@ -48,23 +68,25 @@ datamodule:
           final_dim: [320, 800]
           bot_pct_lim: [0.0, 0.0]
           rot_lim: [0.0, 0.0]
-          rand_flip: false
+          rand_flip: true
         training: true
       - _target_: autoware_ml.transforms.camera.geometry.GlobalRotScaleTrans
-        rot_range: [0.0, 0.0]
-        scale_ratio_range: [1.0, 1.0]
+        rot_range: [-0.3925, 0.3925]
+        scale_ratio_range: [0.95, 1.05]
       - _target_: autoware_ml.transforms.camera.resize.PadMultiViewImage
         size_divisor: 32
       - _target_: autoware_ml.transforms.camera.normalize.NormalizeMultiviewImage
         mean: ${img_norm_cfg.mean}
         std: ${img_norm_cfg.std}
         to_rgb: ${img_norm_cfg.to_rgb}
+      - _target_: autoware_ml.transforms.camera.annotations2d.LoadAnnotations2DFromBoxes3D
   val_transforms:
     _target_: autoware_ml.transforms.base.TransformsCompose
     pipeline:
       - _target_: autoware_ml.transforms.boxes3d.loading.LoadAnnotations3D
         name_mapping: ${dataset.detection3d.name_mapping}
       - _target_: autoware_ml.transforms.camera.loading.LoadMultiViewImagesFromFiles
+        normalize_to_unit: false
       - _target_: autoware_ml.transforms.camera.resize.ResizeCropFlipRotImage
         data_aug_conf:
           resize_lim: [0.47, 0.625]
@@ -86,6 +108,7 @@ datamodule:
     _target_: autoware_ml.transforms.base.TransformsCompose
     pipeline:
       - _target_: autoware_ml.transforms.camera.loading.LoadMultiViewImagesFromFiles
+        normalize_to_unit: false
       - _target_: autoware_ml.transforms.camera.resize.ResizeCropFlipRotImage
         data_aug_conf:
           resize_lim: [0.47, 0.625]
@@ -109,8 +132,51 @@ model:
     frozen_stages: -1
     norm_eval: true
   img_neck:
-    _target_: autoware_ml.models.common.necks.lss_fpn.GeneralizedLSSFPN
+    _target_: autoware_ml.models.common.necks.cp_fpn.CPFPN
     in_channels: [768, 1024]
     out_channels: 256
   bbox_head:
     num_queries: 644
+  img_roi_head:
+    _target_: autoware_ml.models.detection3d.heads.focal2d.FocalHead2D
+    num_classes: ${dataset.detection3d.num_classes}
+    in_channels: 256
+    embed_dims: 256
+    stride: 16
+    loss_cls_weight: 2.0
+    loss_bbox_weight: 5.0
+    loss_iou_weight: 2.0
+    loss_centers2d_weight: 10.0
+    loss_centerness_weight: 1.0
+    class_names: ${dataset.detection3d.class_names}
+    assigner:
+      _target_: autoware_ml.models.detection3d.task_modules.assigners2d.HungarianAssigner2D
+      cls_cost:
+        _target_: autoware_ml.models.detection3d.task_modules.match_costs.ClassificationCost
+        weight: 2.0
+      reg_cost:
+        _target_: autoware_ml.models.detection3d.task_modules.assigners2d.BBoxL1Cost2D
+        weight: 5.0
+        box_format: xywh
+      iou_cost:
+        _target_: autoware_ml.models.detection3d.task_modules.assigners2d.IoUCost2D
+        weight: 2.0
+        iou_mode: giou
+      centers2d_cost:
+        _target_: autoware_ml.models.detection3d.task_modules.assigners2d.Center2DL1Cost
+        weight: 10.0
+  optimizer:
+    lr: 4.0e-4         # tuned for total batch 16; halve it for total batch 8
+  optimizer_group_overrides:
+    img_backbone:
+      lr: 4.0e-5       # lr_mult 0.1
+  scheduler:
+    eta_min_factor: 1.0e-3    # the nuScenes schedule floor; T4 stages use 1e-4
+
+trainer:
+  # Pin to 2 GPUs so total batch stays 16 and the hard-coded LRs above match.
+  devices: 2
+  max_epochs: 30
+  # The nuScenes stage clips at 35; the T4 stages clip at 1.
+  gradient_clip_val: 35.0
+  check_val_every_n_epoch: 5

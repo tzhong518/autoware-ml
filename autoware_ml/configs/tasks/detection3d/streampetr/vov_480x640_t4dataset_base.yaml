@@ -1,0 +1,18 @@
+# @package _global_
+# Stage 2 of the three-stage StreamPETR flow
+# (nuScenes pretrain -> T4 base -> j6gen2 fine-tune).
+#
+# Everything but the split is inherited from the j6gen2 default, including the
+# 35-epoch schedule and validation every 5 epochs. Initialize from the stage-1
+# checkpoint; see docs/models/streampetr.md for the training commands.
+#
+# The base val split is ~12.6k frames, so trainer.check_val_every_n_epoch=1
+# costs ~35x more validation than the default here.
+defaults:
+  - /tasks/detection3d/streampetr/vov_480x640_t4dataset_j6gen2
+  - _self_
+
+datamodule:
+  train_ann_file: info/detection3d/t4dataset_base_infos_train.pkl
+  val_ann_file: info/detection3d/t4dataset_base_infos_val.pkl
+  test_ann_file: info/detection3d/t4dataset_base_infos_test.pkl

@@ -13,6 +13,23 @@ import torch
 import torch.nn as nn
 
 
+def reduce_mean_count(value: torch.Tensor) -> torch.Tensor:
+    """Average a scalar sample count across DDP ranks.
+
+    Loss terms normalized as ``sum / count`` need the global count: because DDP
+    averages gradients, dividing by the same cross-rank mean on every rank
+    yields the true per-object mean over the effective batch. This is DETR's
+    ``num_boxes`` all-reduce / mmdetection's ``reduce_mean``.
+
+    Identity when distributed is unavailable or uninitialized. Being a
+    collective, every rank must call it the same number of times per step.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        value = value.float().clone()
+        torch.distributed.all_reduce(value.div_(torch.distributed.get_world_size()))
+    return value
+
+
 def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """Apply the inverse sigmoid transform with clamping for stability."""
     dtype = x.dtype

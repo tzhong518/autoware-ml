@@ -8,12 +8,17 @@ multi-layer decoder supervision, and optional denoising queries.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
 from autoware_ml.losses.detection3d.focal import SigmoidFocalLoss
+from autoware_ml.models.detection3d.partial_ignore import (
+    normalize_status_flags,
+    resolve_partial_ignore_labels,
+)
 from autoware_ml.models.detection3d.task_modules.assigners import HungarianAssigner3D
 from autoware_ml.models.detection3d.task_modules.bbox_coders import (
     NMSFreeBBoxCoder3D,
@@ -28,6 +33,7 @@ from autoware_ml.models.detection3d.task_modules.streaming import (
     nerf_positional_encoding,
     pos2posemb1d,
     pos2posemb3d,
+    reduce_mean_count,
     topk_gather,
     transform_reference_points,
 )
@@ -110,6 +116,9 @@ class StreamPETRTargets:
     labels: torch.Tensor
     bbox_targets: torch.Tensor
     bbox_weights: torch.Tensor
+    # Per-query-per-class classification weights ``(num_queries, num_classes)``
+    # used by partial-ignore; ``None`` means uniform weights.
+    label_weights: torch.Tensor | None = None
 
 
 class StreamPETRHead(nn.Module):
@@ -146,9 +155,14 @@ class StreamPETRHead(nn.Module):
         dn_weight: float = 1.0,
         split: float = 0.75,
         use_bottom_center: bool = True,
+        class_names: list[str] | None = None,
+        partial_ignore_classes: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
+        self.partial_ignore_labels = resolve_partial_ignore_labels(
+            class_names, partial_ignore_classes
+        )
         self.num_queries = num_queries
         self.num_decoder_layers = num_decoder_layers
         self.hidden_dim = hidden_dim
@@ -744,11 +758,20 @@ class StreamPETRHead(nn.Module):
         box_params: torch.Tensor,
         gt_boxes: list[torch.Tensor],
         gt_labels: list[torch.Tensor],
+        annotation_status: list[bool] | None = None,
     ) -> list[StreamPETRTargets]:
+        use_classwise_weights = (
+            self.partial_ignore_labels is not None
+            and annotation_status is not None
+            and not all(annotation_status)
+        )
         targets: list[StreamPETRTargets] = []
-        for sample_logits, sample_boxes, sample_gt_boxes, sample_gt_labels in zip(
-            cls_logits, box_params, gt_boxes, gt_labels
-        ):
+        for sample_index, (
+            sample_logits,
+            sample_boxes,
+            sample_gt_boxes,
+            sample_gt_labels,
+        ) in enumerate(zip(cls_logits, box_params, gt_boxes, gt_labels)):
             num_queries = sample_logits.shape[0]
             labels = sample_gt_labels.new_full((num_queries,), -1)
             bbox_targets = sample_boxes.new_zeros((num_queries, 9))
@@ -767,9 +790,28 @@ class StreamPETRHead(nn.Module):
                 labels[pos_inds] = sample_gt_labels[matched_gt_inds]
                 bbox_targets[pos_inds] = sample_gt_boxes[matched_gt_inds]
                 bbox_weights[pos_inds] = 1.0
+
+            label_weights = None
+            if use_classwise_weights:
+                label_weights = sample_logits.new_ones((num_queries, self.num_classes))
+                if not annotation_status[sample_index]:
+                    # Zero the partially annotated class columns on negative
+                    # (unmatched) queries only: matched queries carry real
+                    # annotations and keep full supervision.
+                    neg_inds = torch.nonzero(labels < 0, as_tuple=False).squeeze(-1)
+                    if neg_inds.numel() > 0:
+                        ignore_labels = torch.as_tensor(
+                            self.partial_ignore_labels,
+                            device=label_weights.device,
+                            dtype=torch.long,
+                        )
+                        label_weights[neg_inds[:, None], ignore_labels] = 0.0
             targets.append(
                 StreamPETRTargets(
-                    labels=labels, bbox_targets=bbox_targets, bbox_weights=bbox_weights
+                    labels=labels,
+                    bbox_targets=bbox_targets,
+                    bbox_weights=bbox_weights,
+                    label_weights=label_weights,
                 )
             )
         return targets
@@ -780,8 +822,9 @@ class StreamPETRHead(nn.Module):
         bbox_preds: torch.Tensor,
         gt_boxes: list[torch.Tensor],
         gt_labels: list[torch.Tensor],
+        annotation_status: list[bool] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        targets = self._get_targets(cls_scores, bbox_preds, gt_boxes, gt_labels)
+        targets = self._get_targets(cls_scores, bbox_preds, gt_boxes, gt_labels, annotation_status)
 
         target_labels = []
         positive_counts = []
@@ -792,10 +835,25 @@ class StreamPETRHead(nn.Module):
             one_hot[pos_mask, sample_targets.labels[pos_mask]] = 1.0
             target_labels.append(one_hot)
         target_labels_tensor = torch.stack(target_labels, dim=0)
-        # One device sync per decoder layer instead of one per sample.
-        total_pos = int(torch.stack(positive_counts).sum().item())
+        # ``_get_targets`` produces label weights for every sample or for none.
+        label_weights_tensor = None
+        if targets[0].label_weights is not None:
+            label_weights_tensor = torch.stack(
+                [sample_targets.label_weights for sample_targets in targets], dim=0
+            )
+        # Cross-rank mean positive count, so the normalization is independent of
+        # the GPU count (see reduce_mean_count). cls and bbox share the factor,
+        # leaving their relative weighting unchanged. One collective + device
+        # sync per decoder layer, uniform across ranks because this method runs
+        # unconditionally for every layer.
+        total_pos = torch.clamp(
+            reduce_mean_count(torch.stack(positive_counts).sum()), min=1.0
+        ).item()
         loss_cls = self.loss_cls_weight * self.loss_cls(
-            cls_scores, target_labels_tensor, avg_factor=max(total_pos, 1)
+            cls_scores,
+            target_labels_tensor,
+            weights=label_weights_tensor,
+            avg_factor=total_pos,
         )
 
         # The regression loss runs over every query with 0/1 positive weights so
@@ -813,13 +871,13 @@ class StreamPETRHead(nn.Module):
         target_tensor = torch.stack(target_encodings, dim=0)
         weight_tensor = torch.stack(positive_weights, dim=0).unsqueeze(-1)
         per_box = self.loss_bbox(encoded_preds[..., :10], target_tensor) * self.code_weights
-        bbox_loss = self.loss_bbox_weight * (per_box * weight_tensor).sum() / max(total_pos, 1)
+        bbox_loss = self.loss_bbox_weight * (per_box * weight_tensor).sum() / total_pos
         return loss_cls, bbox_loss
 
     def prepare_for_loss(
         self,
         mask_dict: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
         """Gather denoising outputs aligned with the replicated GT targets."""
         output_known_class, output_known_coord = mask_dict["output_known_lbs_bboxes"]
         known_labels, known_bboxs = mask_dict["known_lbs_bboxes"]
@@ -836,7 +894,50 @@ class StreamPETRHead(nn.Module):
                 (batch_selection, map_known_indice)
             ].permute(1, 0, 2)
         num_targets = known_indices.numel()
-        return known_labels, known_bboxs, output_known_class, output_known_coord, num_targets
+        return (
+            known_labels,
+            known_bboxs,
+            output_known_class,
+            output_known_coord,
+            num_targets,
+            batch_selection,
+        )
+
+    def _dn_label_weights(
+        self,
+        cls_scores: torch.Tensor,
+        known_labels: torch.Tensor,
+        known_bids: torch.Tensor | None,
+        annotation_status: list[bool] | None,
+    ) -> torch.Tensor | None:
+        """Build partial-ignore class weights for denoising queries.
+
+        Denoising queries noised into background must not be punished for
+        predicting the partially annotated classes on frames whose scene
+        lacks those annotations.
+        """
+        if (
+            self.partial_ignore_labels is None
+            or known_bids is None
+            or known_bids.numel() == 0
+            or annotation_status is None
+            or all(annotation_status)
+        ):
+            return None
+        status_tensor = torch.as_tensor(
+            annotation_status, device=known_labels.device, dtype=torch.bool
+        )
+        background_mask = known_labels == self.num_classes
+        sample_ignore_mask = ~status_tensor[known_bids.long()]
+        ignore_rows = torch.nonzero(background_mask & sample_ignore_mask, as_tuple=False)
+        if ignore_rows.numel() == 0:
+            return None
+        label_weights = cls_scores.new_ones((known_labels.shape[0], self.num_classes))
+        ignore_labels = torch.as_tensor(
+            self.partial_ignore_labels, device=known_labels.device, dtype=torch.long
+        )
+        label_weights[ignore_rows.squeeze(-1)[:, None], ignore_labels] = 0.0
+        return label_weights
 
     def dn_loss_single(
         self,
@@ -844,13 +945,22 @@ class StreamPETRHead(nn.Module):
         bbox_preds: torch.Tensor,
         known_bboxs: torch.Tensor,
         known_labels: torch.Tensor,
-        num_total_pos: int,
+        num_total_pos: float,
+        known_bids: torch.Tensor | None = None,
+        annotation_status: list[bool] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute denoising-query supervision for one decoder layer."""
+        """Compute denoising-query supervision for one decoder layer.
+
+        ``num_total_pos`` is the cross-rank mean denoising-target count, already
+        clamped to >= 1 and synchronized once per step by :meth:`loss`.
+        """
         class_targets = cls_scores.new_zeros((known_labels.shape[0], self.num_classes))
         foreground = known_labels < self.num_classes
         if foreground.any():
             class_targets[foreground, known_labels[foreground]] = 1.0
+        label_weights = self._dn_label_weights(
+            cls_scores, known_labels, known_bids, annotation_status
+        )
         # The classification average factor scales the target count by the
         # expected positive rate of the noised queries (reference recipe):
         # a ball of radius ``split`` inside the unit noise cube.
@@ -858,7 +968,9 @@ class StreamPETRHead(nn.Module):
         loss_cls = (
             self.dn_weight
             * self.loss_cls_weight
-            * self.loss_cls(cls_scores, class_targets, avg_factor=cls_avg_factor)
+            * self.loss_cls(
+                cls_scores, class_targets, weights=label_weights, avg_factor=cls_avg_factor
+            )
         )
 
         target_encoding = normalize_boxes3d(known_bboxs)
@@ -868,7 +980,7 @@ class StreamPETRHead(nn.Module):
             * (
                 self.loss_bbox(bbox_preds[:, :10], target_encoding[:, :10]) * self.code_weights
             ).sum()
-            / max(num_total_pos, 1)
+            / num_total_pos
         )
         return loss_cls, loss_bbox
 
@@ -993,16 +1105,22 @@ class StreamPETRHead(nn.Module):
         outputs: dict[str, torch.Tensor],
         gt_boxes: list[torch.Tensor],
         gt_labels: list[torch.Tensor],
+        traffic_cone_barrier_status: Sequence[bool] | torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute multi-layer StreamPETR losses."""
         all_cls_scores = outputs["all_cls_scores"]
         all_bbox_preds = outputs["all_bbox_preds"]
         gt_boxes = self._gravity_center_boxes(gt_boxes)
+        annotation_status = None
+        if self.partial_ignore_labels is not None:
+            annotation_status = normalize_status_flags(traffic_cone_barrier_status, len(gt_boxes))
 
         losses_cls = []
         losses_bbox = []
         for cls_scores, bbox_preds in zip(all_cls_scores, all_bbox_preds):
-            loss_cls, loss_bbox = self._loss_single(cls_scores, bbox_preds, gt_boxes, gt_labels)
+            loss_cls, loss_bbox = self._loss_single(
+                cls_scores, bbox_preds, gt_boxes, gt_labels, annotation_status
+            )
             losses_cls.append(loss_cls)
             losses_bbox.append(loss_bbox)
 
@@ -1016,25 +1134,51 @@ class StreamPETRHead(nn.Module):
             loss_dict[f"d{layer_index}.loss_bbox"] = loss_bbox
             total_loss = total_loss + loss_cls + loss_bbox
 
-        if outputs["dn_mask_dict"] is None and self.with_dn and self.training:
-            # Keep the loss dictionary uniform across ranks when a batch has
-            # no ground truth: every logged key is a distributed collective.
-            zero = all_cls_scores.new_tensor(0.0)
-            loss_dict["dn_loss_cls"] = zero
-            loss_dict["dn_loss_bbox"] = zero.clone()
-            for layer_index in range(self.num_decoder_layers - 1):
-                loss_dict[f"d{layer_index}.dn_loss_cls"] = zero.clone()
-                loss_dict[f"d{layer_index}.dn_loss_bbox"] = zero.clone()
+        dn_mask_dict = outputs["dn_mask_dict"]
+        if dn_mask_dict is not None:
+            (
+                known_labels,
+                known_bboxs,
+                output_known_class,
+                output_known_coord,
+                num_tgt,
+                known_bids,
+            ) = self.prepare_for_loss(dn_mask_dict)
+        else:
+            num_tgt = 0
+            if self.with_dn and self.training:
+                # Keep the loss dictionary uniform across ranks when a batch has
+                # no ground truth: every logged key is a distributed collective.
+                zero = all_cls_scores.new_tensor(0.0)
+                loss_dict["dn_loss_cls"] = zero
+                loss_dict["dn_loss_bbox"] = zero.clone()
+                for layer_index in range(self.num_decoder_layers - 1):
+                    loss_dict[f"d{layer_index}.dn_loss_cls"] = zero.clone()
+                    loss_dict[f"d{layer_index}.dn_loss_bbox"] = zero.clone()
 
-        if outputs["dn_mask_dict"] is not None:
-            known_labels, known_bboxs, output_known_class, output_known_coord, num_tgt = (
-                self.prepare_for_loss(outputs["dn_mask_dict"])
-            )
+        if self.with_dn and self.training:
+            # Cross-rank mean denoising-target count, synced once per step. Gated
+            # only on flags that are uniform across ranks, never on this rank's
+            # GT presence: a rank without ground truth must still join the
+            # collective, contributing count 0.
+            dn_avg_factor = torch.clamp(
+                reduce_mean_count(all_cls_scores.new_tensor(float(num_tgt))), min=1.0
+            ).item()
+        else:
+            dn_avg_factor = max(float(num_tgt), 1.0)
+
+        if dn_mask_dict is not None:
             dn_losses_cls = []
             dn_losses_bbox = []
             for cls_scores, bbox_preds in zip(output_known_class, output_known_coord):
                 dn_loss_cls, dn_loss_bbox = self.dn_loss_single(
-                    cls_scores, bbox_preds, known_bboxs, known_labels, num_tgt
+                    cls_scores,
+                    bbox_preds,
+                    known_bboxs,
+                    known_labels,
+                    dn_avg_factor,
+                    known_bids=known_bids,
+                    annotation_status=annotation_status,
                 )
                 dn_losses_cls.append(dn_loss_cls)
                 dn_losses_bbox.append(dn_loss_bbox)
